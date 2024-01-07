@@ -33,7 +33,7 @@
   "license": "MIT",
   "peerDependencies": {
     "esbuild": ">=0.9.6",
-    "svelte": ">=3.43.0 <5"
+    "svelte": ">=3.43.0"
   },
   "devDependencies": {
     "@types/node": "^16.18.37",
@@ -41,8 +41,7 @@
     "prettier": "^3.0.0",
     "rewrite-imports": "^3.0.0",
     "sass": "^1.66.1",
-    "svelte": "^4.2.0",
-    "svelte-preprocess-esbuild": "^3.0.0",
+    "svelte": "^5.0.0-next.27",
     "svelte-preprocess-sass": "^2.0.1",
     "typescript": "^5.2.2",
     "uvu": "^0.5.6"

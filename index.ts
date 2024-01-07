@@ -1,11 +1,11 @@
 //original version from https://github.com/evanw/esbuild/blob/plugins/docs/plugin-examples.md
-import { preprocess, compile, VERSION } from "svelte/compiler";
+import { preprocess, compile, compileModule, VERSION, ModuleCompileOptions } from "svelte/compiler";
 import { dirname, basename, relative } from "path";
 import { promisify } from "util";
 import { readFile, statSync } from "fs";
 import { originalPositionFor, TraceMap } from "@jridgewell/trace-mapping";
 
-import type { CompileOptions, Warning } from "svelte/types/compiler/interfaces";
+import type { CompileOptions, Warning } from "svelte/compiler";
 import type { PreprocessorGroup } from "svelte/types/compiler/preprocess";
 import type { OnLoadResult, Plugin, PluginBuild, Location, PartialMessage } from "esbuild";
 
@@ -14,6 +14,11 @@ interface esbuildSvelteOptions {
      * Svelte compiler options
      */
     compilerOptions?: CompileOptions;
+
+    /**
+     * Svelte module compiler options
+     */
+    moduleCompileOptions?: ModuleCompileOptions;
 
     /**
      * The preprocessor(s) to run the Svelte code through before compiling
@@ -102,11 +107,16 @@ const shouldCache = (
 const b64enc = Buffer
     ? (b: string) => Buffer.from(b).toString("base64")
     : (b: string) => btoa(encodeURIComponent(b));
+
 function toUrl(data: string) {
     return "data:application/json;charset=utf-8;base64," + b64enc(data);
 }
 
-const SVELTE_FILTER = /\.svelte$/;
+function getContents(js: { code: string; map: import("magic-string").SourceMap }): string {
+    return js.code + `\n//# sourceMappingURL=` + toUrl(js.map.toString());
+}
+
+const SVELTE_FILTER = /\.svelte|\.js$/;
 const FAKE_CSS_FILTER = /\.esbuild-svelte-fake-css$/;
 
 export default function sveltePlugin(options?: esbuildSvelteOptions): Plugin {
@@ -196,147 +206,178 @@ export default function sveltePlugin(options?: esbuildSvelteOptions): Plugin {
                 //reading files
                 let originalSource = await promisify(readFile)(args.path, "utf8");
                 let filename = relative(process.cwd(), args.path);
+                let isJs = filename.endsWith(".js");
 
                 //file modification time storage
                 const dependencyModifcationTimes = new Map<string, Date>();
                 dependencyModifcationTimes.set(args.path, statSync(args.path).mtime); // add the target file
 
-                let compilerOptions = {
-                    css: (svelteVersion < 3 ? false : "external") as boolean | "external",
-                    ...options?.compilerOptions,
-                };
+                let result: OnLoadResult = {};
+                let source = originalSource;
 
                 //actually compile file
-                try {
-                    let source = originalSource;
+                if (isJs) {
+                    if (args.path.includes("node_modules")) {
+                        return {};
+                    }
+                    console.log(args.path);
+                    let moduleCompileOptions: ModuleCompileOptions = {
+                        ...options?.moduleCompileOptions,
+                        filename,
+                    };
+                    // console.log('doing module stuff', {...options?.moduleCompileOptions, filename })
 
-                    //do preprocessor stuff if it exists
-                    if (options?.preprocess) {
-                        let preprocessResult = null;
+                    try {
+                        const { js, warnings } = compileModule(source, moduleCompileOptions);
+                        result = {
+                            contents: getContents(js),
+                            warnings: await Promise.all(
+                                warnings.map(
+                                    async (e) => await convertMessage(e, args.path, source, null),
+                                ),
+                            ),
+                        };
+                    } catch (e: any) {
+                        result.errors = [await convertMessage(e, args.path, originalSource, null)];
+                        // only provide if context API is supported or we are caching
+                        if (build.esbuild?.context !== undefined || shouldCache(build)) {
+                            result.watchFiles = previousWatchFiles;
+                        }
+                    }
+                } else {
+                    let compilerOptions: CompileOptions = {
+                        css: "external",
+                        ...options?.compilerOptions,
+                    };
+                    try {
+                        //do preprocessor stuff if it exists
+                        if (options?.preprocess) {
+                            let preprocessResult = null;
 
-                        try {
-                            preprocessResult = await preprocess(
-                                originalSource,
-                                options.preprocess,
-                                {
-                                    filename,
-                                },
-                            );
-                        } catch (e: any) {
-                            // if preprocess failed there are chances that an external dependency caused exception
-                            // to avoid stop watching those files, we keep the previous dependencies if available
-                            if (cachedFile) {
-                                previousWatchFiles = Array.from(cachedFile.dependencies.keys());
+                            try {
+                                preprocessResult = await preprocess(
+                                    originalSource,
+                                    options.preprocess,
+                                    {
+                                        filename,
+                                    },
+                                );
+                            } catch (e: any) {
+                                // if preprocess failed there are chances that an external dependency caused exception
+                                // to avoid stop watching those files, we keep the previous dependencies if available
+                                if (cachedFile) {
+                                    previousWatchFiles = Array.from(cachedFile.dependencies.keys());
+                                }
+                                throw e;
                             }
-                            throw e;
+
+                            if (preprocessResult.map) {
+                                // normalize the sourcemap 'source' entrys to all match if they are the same file
+                                // needed because of differing handling of file names in preprocessors
+                                let fixedMap = preprocessResult.map as { sources: Array<string> };
+                                for (let index = 0; index < fixedMap?.sources.length; index++) {
+                                    if (fixedMap.sources[index] == filename) {
+                                        fixedMap.sources[index] = basename(filename);
+                                    }
+                                }
+                                compilerOptions.sourcemap = fixedMap;
+                            }
+                            source = preprocessResult.code;
+
+                            // if caching then we need to store the modifcation times for all dependencies
+                            if (options?.cache === true) {
+                                preprocessResult.dependencies?.forEach((entry) => {
+                                    dependencyModifcationTimes.set(entry, statSync(entry).mtime);
+                                });
+                            }
                         }
 
-                        if (preprocessResult.map) {
-                            // normalize the sourcemap 'source' entrys to all match if they are the same file
-                            // needed because of differing handling of file names in preprocessors
-                            let fixedMap = preprocessResult.map as { sources: Array<string> };
-                            for (let index = 0; index < fixedMap?.sources.length; index++) {
-                                if (fixedMap.sources[index] == filename) {
-                                    fixedMap.sources[index] = basename(filename);
+                        let { js, css, warnings } = compile(source, {
+                            ...compilerOptions,
+                            filename,
+                        });
+
+                        //esbuild doesn't seem to like sourcemaps without "sourcesContent" which Svelte doesn't provide
+                        //so attempt to populate that array if we can find filename in sources
+                        if (compilerOptions.sourcemap) {
+                            if (js.map.sourcesContent == undefined) {
+                                js.map.sourcesContent = [];
+                            }
+
+                            for (let index = 0; index < js.map.sources.length; index++) {
+                                const element = js.map.sources[index];
+                                if (element == basename(filename)) {
+                                    js.map.sourcesContent[index] = originalSource;
+                                    index = Infinity; //can break out of loop
                                 }
                             }
-                            compilerOptions.sourcemap = fixedMap;
                         }
-                        source = preprocessResult.code;
 
-                        // if caching then we need to store the modifcation times for all dependencies
+                        let contents = getContents(js);
+
+                        //if svelte emits css seperately, then store it in a map and import it from the js
+                        if (compilerOptions.css === "external" && css?.code) {
+                            let cssPath = args.path
+                                .replace(".svelte", ".esbuild-svelte-fake-css") //TODO append instead of replace to support different svelte filters
+                                .replace(/\\/g, "/");
+                            cssCode.set(
+                                cssPath,
+                                css.code + `/*# sourceMappingURL=${toUrl(css.map.toString())} */`,
+                            );
+                            contents = contents + `\nimport "${cssPath}";`;
+                        }
+
+                        if (options?.filterWarnings) {
+                            warnings = warnings.filter(options.filterWarnings);
+                        }
+
+                        result = {
+                            contents,
+                            warnings: await Promise.all(
+                                warnings.map(
+                                    async (e) =>
+                                        await convertMessage(
+                                            e,
+                                            args.path,
+                                            source,
+                                            compilerOptions.sourcemap,
+                                        ),
+                                ),
+                            ),
+                        };
+
+                        // if we are told to cache, then cache
                         if (options?.cache === true) {
-                            preprocessResult.dependencies?.forEach((entry) => {
-                                dependencyModifcationTimes.set(entry, statSync(entry).mtime);
+                            fileCache.set(args.path, {
+                                data: result,
+                                dependencies: dependencyModifcationTimes,
                             });
                         }
-                    }
 
-                    let { js, css, warnings } = compile(source, { ...compilerOptions, filename });
-
-                    //esbuild doesn't seem to like sourcemaps without "sourcesContent" which Svelte doesn't provide
-                    //so attempt to populate that array if we can find filename in sources
-                    if (compilerOptions.sourcemap) {
-                        if (js.map.sourcesContent == undefined) {
-                            js.map.sourcesContent = [];
+                        // make sure to tell esbuild to watch any additional files used if supported
+                        // only provide if context API is supported or we are caching
+                        if (build.esbuild?.context !== undefined || shouldCache(build)) {
+                            result.watchFiles = Array.from(dependencyModifcationTimes.keys());
                         }
 
-                        for (let index = 0; index < js.map.sources.length; index++) {
-                            const element = js.map.sources[index];
-                            if (element == basename(filename)) {
-                                js.map.sourcesContent[index] = originalSource;
-                                index = Infinity; //can break out of loop
-                            }
-                        }
-                    }
-
-                    let contents = js.code + `\n//# sourceMappingURL=` + toUrl(js.map.toString());
-
-                    //if svelte emits css seperately, then store it in a map and import it from the js
-                    if (
-                        (compilerOptions.css === false || compilerOptions.css === "external") &&
-                        css.code
-                    ) {
-                        let cssPath = args.path
-                            .replace(".svelte", ".esbuild-svelte-fake-css") //TODO append instead of replace to support different svelte filters
-                            .replace(/\\/g, "/");
-                        cssCode.set(
-                            cssPath,
-                            css.code + `/*# sourceMappingURL=${toUrl(css.map.toString())} */`,
-                        );
-                        contents = contents + `\nimport "${cssPath}";`;
-                    }
-
-                    if (options?.filterWarnings) {
-                        warnings = warnings.filter(options.filterWarnings);
-                    }
-
-                    const result: OnLoadResult = {
-                        contents,
-                        warnings: await Promise.all(
-                            warnings.map(
-                                async (e) =>
-                                    await convertMessage(
-                                        e,
-                                        args.path,
-                                        source,
-                                        compilerOptions.sourcemap,
-                                    ),
+                        // return result;
+                    } catch (e: any) {
+                        result.errors = [
+                            await convertMessage(
+                                e,
+                                args.path,
+                                originalSource,
+                                compilerOptions.sourcemap,
                             ),
-                        ),
-                    };
-
-                    // if we are told to cache, then cache
-                    if (options?.cache === true) {
-                        fileCache.set(args.path, {
-                            data: result,
-                            dependencies: dependencyModifcationTimes,
-                        });
+                        ];
+                        // only provide if context API is supported or we are caching
+                        if (build.esbuild?.context !== undefined || shouldCache(build)) {
+                            result.watchFiles = previousWatchFiles;
+                        }
                     }
-
-                    // make sure to tell esbuild to watch any additional files used if supported
-                    // only provide if context API is supported or we are caching
-                    if (build.esbuild?.context !== undefined || shouldCache(build)) {
-                        result.watchFiles = Array.from(dependencyModifcationTimes.keys());
-                    }
-
-                    return result;
-                } catch (e: any) {
-                    let result: OnLoadResult = {};
-                    result.errors = [
-                        await convertMessage(
-                            e,
-                            args.path,
-                            originalSource,
-                            compilerOptions.sourcemap,
-                        ),
-                    ];
-                    // only provide if context API is supported or we are caching
-                    if (build.esbuild?.context !== undefined || shouldCache(build)) {
-                        result.watchFiles = previousWatchFiles;
-                    }
-                    return result;
                 }
+
+                return result;
             });
 
             //if the css exists in our map, then output it with the css loader

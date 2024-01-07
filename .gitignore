@@ -10,3 +10,5 @@ example/dist/
 example/package-lock.json
 
 *.log
+
+.idea

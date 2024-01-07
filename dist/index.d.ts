@@ -1,4 +1,5 @@
-import type { CompileOptions, Warning } from "svelte/types/compiler/interfaces";
+import { ModuleCompileOptions } from "svelte/compiler";
+import type { CompileOptions, Warning } from "svelte/compiler";
 import type { PreprocessorGroup } from "svelte/types/compiler/preprocess";
 import type { Plugin } from "esbuild";
 interface esbuildSvelteOptions {
@@ -6,6 +7,10 @@ interface esbuildSvelteOptions {
      * Svelte compiler options
      */
     compilerOptions?: CompileOptions;
+    /**
+     * Svelte module compiler options
+     */
+    moduleCompileOptions?: ModuleCompileOptions;
     /**
      * The preprocessor(s) to run the Svelte code through before compiling
      */
